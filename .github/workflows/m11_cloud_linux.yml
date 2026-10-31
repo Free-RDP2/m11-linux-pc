@@ -77,9 +77,10 @@ jobs:
       run: |
         echo ">>> Installing XFCE4 Desktop, XRDP, Sound & Graphics Tools... <<<"
         sudo apt-get update -qq
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
           xfce4 xfce4-goodies xfce4-terminal \
-          xrdp dbus-x11 x11vnc novnc websockify \
+          xrdp xorgxrdp xorg xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-dummy xinit tigervnc-standalone-server xvfb \
+          dbus-x11 x11vnc novnc websockify \
           mesa-utils mesa-va-drivers mesa-vulkan-drivers libgl1-mesa-dri \
           pulseaudio pavucontrol \
           fonts-noto-core fonts-dejavu-core fonts-kacst \
@@ -88,15 +89,100 @@ jobs:
 
         # Configure dedicated high-privilege gaming user: m11dev
         echo ">>> Configuring Dedicated Gaming User (m11dev)... <<<"
-        sudo useradd -m -s /bin/bash -G sudo,audio,video,render m11dev || true
+        sudo useradd -m -s /bin/bash -G sudo,audio,video,render,tty,ssl-cert m11dev || true
         echo "m11dev:M11Pass#2026" | sudo chpasswd
         echo "m11dev ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/m11dev
         echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers.d/m11dev
 
-        # Configure XFCE Session for XRDP
-        echo "xfce4-session" | sudo tee /home/m11dev/.xsession
+        # Add users to necessary groups for audio/video/xrdp
+        sudo adduser xrdp ssl-cert 2>/dev/null || true
+        sudo adduser m11dev ssl-cert 2>/dev/null || true
+        sudo adduser xrdp shadow 2>/dev/null || true
+
+        # Clean X11 socket directory
+        sudo mkdir -p /tmp/.X11-unix
+        sudo chmod 1777 /tmp/.X11-unix
+
+        # Allow non-console users to start X server via Xorg.wrap
+        sudo bash -c 'cat > /etc/X11/Xwrapper.config << "EOF"
+        allowed_users=anybody
+        needs_root_rights=no
+        EOF'
+
+        # Configure sesman permissions & security
+        sudo sed -i 's/TerminalServerUsers=tsusers/TerminalServerUsers=/g' /etc/xrdp/sesman.ini 2>/dev/null || true
+        sudo sed -i 's/AlwaysGroupCheck=true/AlwaysGroupCheck=false/g' /etc/xrdp/sesman.ini 2>/dev/null || true
+        sudo sed -i 's/param=\/usr\/lib\/xorg\/Xorg/param=\/usr\/bin\/Xorg/g' /etc/xrdp/sesman.ini 2>/dev/null || true
+
+        # Reorder xrdp.ini so Xvnc is primary session and prefill m11dev username
+        sudo python3 -c '
+        with open("/etc/xrdp/xrdp.ini", "r") as f:
+            x = f.read()
+        if "[Xorg]\nname=Xorg" in x and "[Xvnc]\nname=Xvnc" in x:
+            org_start = x.find("[Xorg]")
+            vnc_start = x.find("[Xvnc]")
+            vnc_end = x.find("\n\n[", vnc_start)
+            if vnc_end == -1: vnc_end = len(x)
+            org_block = x[org_start:vnc_start].strip().replace("username=ask", "username=m11dev")
+            vnc_block = x[vnc_start:vnc_end].strip().replace("username=ask", "username=m11dev")
+            combined = vnc_block + "\n\n" + org_block
+            x = x[:org_start] + combined + x[vnc_end:]
+        x = x.replace("max_bpp=32", "max_bpp=24").replace("xserverbpp=24", "xserverbpp=24")
+        with open("/etc/xrdp/xrdp.ini", "w") as f:
+            f.write(x)
+        '
+
+        # Configure Polkit rules to eliminate annoying authentication popups
+        sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+        sudo bash -c 'cat > /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla << "EOF"
+        [Allow Colord all Users]
+        Identity=unix-user:*
+        Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
+        ResultAny=no
+        ResultInactive=no
+        ResultActive=yes
+
+        [Allow NetworkManager all Users]
+        Identity=unix-user:*
+        Action=org.freedesktop.NetworkManager.*
+        ResultAny=no
+        ResultInactive=no
+        ResultActive=yes
+        EOF'
+
+        # Configure startwm.sh to cleanly launch XFCE4 via dbus-run-session
+        sudo bash -c 'cat > /etc/xrdp/startwm.sh << "EOF"
+        #!/bin/sh
+        if [ -r /etc/default/locale ]; then
+          . /etc/default/locale
+          export LANG LANGUAGE
+        fi
+
+        unset DBUS_SESSION_BUS_ADDRESS
+        unset SESSION_MANAGER
+        export XDG_CURRENT_DESKTOP="XFCE"
+        export XDG_SESSION_DESKTOP="xfce"
+
+        exec dbus-run-session -- xfce4-session
+        EOF'
+        sudo chmod +x /etc/xrdp/startwm.sh
+
+        # Configure User XFCE Session scripts
+        sudo bash -c 'cat > /home/m11dev/.xsession << "EOF"
+        #!/bin/sh
+        unset DBUS_SESSION_BUS_ADDRESS
+        unset SESSION_MANAGER
+        export XDG_CURRENT_DESKTOP="XFCE"
+        export XDG_SESSION_DESKTOP="xfce"
+
+        exec dbus-run-session -- xfce4-session
+        EOF'
         sudo chown m11dev:m11dev /home/m11dev/.xsession
         sudo chmod +x /home/m11dev/.xsession
+
+        exec startxfce4
+        EOF'
+        sudo chmod +x /etc/xrdp/startwm.sh
 
         # Configure Bilingual Keyboard: English (US) + Arabic (Egypt) with Alt+Shift Toggle
         sudo bash -c 'cat > /etc/default/keyboard << "EOF"
@@ -108,24 +194,20 @@ jobs:
         EOF'
 
         # Preload Alt+Shift XKB script in user profile
-        sudo -u m11dev bash -c 'cat > ~/.xprofile << "EOF"
+        sudo -u m11dev bash -c 'cat > /home/m11dev/.xprofile << "EOF"
         setxkbmap -layout us,ara -option grp:alt_shift_toggle &
         pulseaudio --start --exit-idle-time=-1 &
         EOF'
-        sudo chmod +x /home/m11dev/.xprofile
+        sudo chown -R m11dev:m11dev /home/m11dev
+        sudo chmod 755 /home/m11dev
 
-        # Optimize XRDP Configuration for High FPS & Zero Latency
-        sudo sed -i 's/max_bpp=32/max_bpp=24/g' /etc/xrdp/xrdp.ini 2>/dev/null || true
-        sudo sed -i 's/xserverbpp=24/xserverbpp=24/g' /etc/xrdp/xrdp.ini 2>/dev/null || true
-        sudo sed -i 's/#tcp_nodelay=true/tcp_nodelay=true/g' /etc/xrdp/xrdp.ini 2>/dev/null || true
-        sudo adduser xrdp ssl-cert 2>/dev/null || true
-        sudo systemctl restart xrdp 2>/dev/null || sudo service xrdp restart 2>/dev/null || sudo /etc/init.d/xrdp restart 2>/dev/null || true
+        # Cleanly restart XRDP services
+        sudo systemctl restart xrdp xrdp-sesman 2>/dev/null || sudo service xrdp restart 2>/dev/null || true
 
-        # Start NoVNC Web Server on Port 6080 for Zero-Client Browser Access
-        echo ">>> Launching HTML5 NoVNC Web Desktop on port 6080... <<<"
-        sudo -u m11dev bash -c 'x11vnc -display :0 -forever -shared -rfbport 5900 -nopw -bg 2>/dev/null || true'
-        sudo websockify --web /usr/share/novnc 6080 localhost:5900 >/dev/null 2>&1 &
-        echo "XRDP (Port 3389) and NoVNC (Port 6080) are active!"
+        # Start HTML5 NoVNC Web Gateway on port 6080
+        echo ">>> Launching HTML5 NoVNC Web Gateway on port 6080... <<<"
+        sudo websockify --web /usr/share/novnc 6080 localhost:5900 > /dev/null 2>&1 &
+        echo "XRDP (Port 3389) and NoVNC Gateway (Port 6080) are active!"
     - name: 3. Restore User Persistent State & Cloud Files
       run: |
         echo ">>> Restoring User Persistent Files from Cloud State... <<<"
@@ -382,30 +464,39 @@ jobs:
         curl -fsSL https://tailscale.com/install.sh | sudo sh
         sudo systemctl enable --now tailscaled 2>/dev/null || sudo tailscaled --tun=userspace-networking >/dev/null 2>&1 &
         sleep 3
-        sudo tailscale up --authkey="${{ github.event.inputs.tunnel_token }}" --hostname="m11-linux-pc" --accept-routes 2>/dev/null || true
+        # Strict 15s timeout prevents hanging indefinitely on expired or single-use auth keys
+        timeout 15s sudo tailscale up --authkey="${{ github.event.inputs.tunnel_token }}" --hostname="m11-linux-pc" --accept-routes --timeout=10s 2>/dev/null || true
         IP=""
-        for i in {1..15}; do
+        for i in {1..8}; do
           IP=$(sudo tailscale ip -4 2>/dev/null || tailscale ip -4 2>/dev/null || true)
           if [ -n "$IP" ] && [ "$IP" != "127.0.0.1" ]; then break; fi
-          sleep 2
+          sleep 1
         done
 
-        # If Tailscale key was expired/single-use, auto-deploy Pinggy instant public tunnel as fallback!
+        # If Tailscale key was expired/single-use or pending, auto-deploy Pinggy instant public tunnel as fallback!
         if [ -z "$IP" ] || [ "$IP" = "127.0.0.1" ]; then
-          echo "[NOTICE] Tailscale Auth Key pending or inactive. Activating Pinggy Instant Public Tunnel..."
-          ssh -p 443 -R0:localhost:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 a.pinggy.io > pinggy.log 2>&1 &
+          echo "[NOTICE] Tailscale Auth Key inactive or single-use. Activating Pinggy Instant Public Tunnel fallback..."
+          ssh -p 443 -R0:localhost:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -T a.pinggy.io > /tmp/pinggy_rdp.log 2>&1 &
+          ssh -p 443 -R0:localhost:6080 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -T a.pinggy.io > /tmp/pinggy_web.log 2>&1 &
           sleep 8
-          ENDPOINT=$(grep -oE 'tcp://[^ ]+' pinggy.log | head -n 1)
+          ENDPOINT=$(grep -oE 'tcp://[^ ]+' /tmp/pinggy_rdp.log | head -n 1)
           if [ -z "$ENDPOINT" ]; then
-              ENDPOINT=$(grep -oE '[a-zA-Z0-9.-]+\.a\.pinggy\.link:[0-9]+' pinggy.log | head -n 1)
+              ENDPOINT=$(grep -oE '[a-zA-Z0-9.-]+\.a\.pinggy\.link:[0-9]+' /tmp/pinggy_rdp.log | head -n 1)
           fi
+          WEB_HOST=$(grep -oE 'https://[a-zA-Z0-9.-]+\.a\.pinggy\.link' /tmp/pinggy_web.log | head -n 1)
           CLEAN=$(echo "$ENDPOINT" | sed 's/tcp:\/\///')
           HOST=$(echo "$CLEAN" | cut -d':' -f1)
           PORT=$(echo "$CLEAN" | cut -d':' -f2)
+          if [ -n "$WEB_HOST" ]; then
+            WEB_URL="${WEB_HOST}/vnc.html"
+          else
+            WEB_URL="http://${HOST}:6080/vnc.html"
+          fi
         else
           ENDPOINT="$IP:3389"
           HOST="$IP"
           PORT="3389"
+          WEB_URL="http://$HOST:6080/vnc.html"
         fi
 
         echo "======================================================"
@@ -421,7 +512,7 @@ jobs:
           "host": "$HOST",
           "port": "$PORT",
           "web_port": "6080",
-          "web_url": "http://$HOST:6080/vnc.html",
+          "web_url": "$WEB_URL",
           "username": "m11dev",
           "password": "M11Pass#2026",
           "specs": "16GB RAM / 4 vCPUs / 100GB SSD (Linux 60 FPS Mesa3D)",
@@ -434,21 +525,33 @@ jobs:
       run: |
         echo "Launching Pinggy Direct Public Tunnel..."
         TOKEN="${{ github.event.inputs.tunnel_token }}"
-        SSH_CMD="ssh -p 443 -R0:localhost:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 a.pinggy.io"
+        SSH_TARGET="a.pinggy.io"
         if [ -n "$TOKEN" ]; then
-            SSH_CMD="ssh -p 443 -R0:localhost:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 ${TOKEN}@a.pinggy.io"
+            SSH_TARGET="${TOKEN}@a.pinggy.io"
         fi
-        $SSH_CMD > pinggy.log 2>&1 &
+        ssh -p 443 -R0:localhost:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -T $SSH_TARGET > /tmp/pinggy_rdp.log 2>&1 &
+        ssh -p 443 -R0:localhost:6080 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -T $SSH_TARGET > /tmp/pinggy_web.log 2>&1 &
         sleep 8
 
-        ENDPOINT=$(grep -oE 'tcp://[^ ]+' pinggy.log | head -n 1)
+        ENDPOINT=$(grep -oE 'tcp://[^ ]+' /tmp/pinggy_rdp.log | head -n 1)
         if [ -z "$ENDPOINT" ]; then
-            ENDPOINT=$(grep -oE '[a-zA-Z0-9.-]+\.a\.pinggy\.link:[0-9]+' pinggy.log | head -n 1)
+            ENDPOINT=$(grep -oE '[a-zA-Z0-9.-]+\.a\.pinggy\.link:[0-9]+' /tmp/pinggy_rdp.log | head -n 1)
         fi
-        echo ">>>M11_ENDPOINT_START<<<$ENDPOINT>>>M11_ENDPOINT_END<<<"
+        WEB_HOST=$(grep -oE 'https://[a-zA-Z0-9.-]+\.a\.pinggy\.link' /tmp/pinggy_web.log | head -n 1)
         CLEAN=$(echo "$ENDPOINT" | sed 's/tcp:\/\///')
         HOST=$(echo "$CLEAN" | cut -d':' -f1)
         PORT=$(echo "$CLEAN" | cut -d':' -f2)
+        if [ -n "$WEB_HOST" ]; then
+          WEB_URL="${WEB_HOST}/vnc.html"
+        else
+          WEB_URL="http://${HOST}:6080/vnc.html"
+        fi
+
+        echo "======================================================"
+        echo ">>>M11_ENDPOINT_START<<<$ENDPOINT>>>M11_ENDPOINT_END<<<"
+        echo "M11_USER: m11dev"
+        echo "M11_PASS: M11Pass#2026"
+        echo "======================================================"
 
         cat << EOF > m11_connect.json
         {
@@ -457,7 +560,7 @@ jobs:
           "host": "$HOST",
           "port": "$PORT",
           "web_port": "6080",
-          "web_url": "http://$HOST:6080/vnc.html",
+          "web_url": "$WEB_URL",
           "username": "m11dev",
           "password": "M11Pass#2026",
           "specs": "16GB RAM / 4 vCPUs / 100GB SSD (Linux 60 FPS Mesa3D)",
